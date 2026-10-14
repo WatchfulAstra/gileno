@@ -17,7 +17,7 @@
   #enter { margin-top:22px; padding:14px 38px; font:inherit; font-size:18px; color:#e9dfc4; background:transparent;
     border:1px solid #6f6650; border-radius:2px; }
   #enter:active { background:#2a261c; }
-  #loading { color:#6f6650; font-size:14px; margin-top:16px; }
+  #enter:disabled { opacity:.5; }
   #joy { position:fixed; left:22px; bottom:26px; width:130px; height:130px; border-radius:50%;
     border:1px solid rgba(207,198,176,.3); background:rgba(207,198,176,.05); display:none; z-index:5; }
   #knob { position:absolute; left:50%; top:50%; width:54px; height:54px; margin:-27px 0 0 -27px; border-radius:50%;
@@ -29,11 +29,18 @@
   #bJump { right:24px; bottom:40px; }
   #bRun { right:100px; bottom:70px; }
   #hint { position:fixed; left:0; right:0; top:14px; text-align:center; font-size:13px; color:#8a8269; pointer-events:none; transition:opacity 2s; }
+  #dbg { position:fixed; left:8px; top:8px; width:210px; padding:8px; background:rgba(0,0,0,.72); border:1px solid #4a4536;
+    font:11px/1.3 monospace; color:#cfc6b0; z-index:20; display:none; }
+  #dbg label { display:flex; align-items:center; gap:4px; margin:2px 0; }
+  #dbg label span { width:22px; } #dbg input[type=range] { flex:1; min-width:0; }
+  #dbg select { width:100%; background:#111; color:#cfc6b0; border:1px solid #4a4536; margin-bottom:4px; }
+  #dbg pre { margin:4px 0 0; white-space:pre-wrap; user-select:text; -webkit-user-select:text; }
 </style>
 </head>
 <body>
 <div id="vignette"></div>
 <div id="hint"></div>
+<div id="dbg"></div>
 <div id="joy"><div id="knob"></div></div>
 <div class="btn" id="bLight">Light</div>
 <div class="btn" id="bRun">Run</div>
@@ -44,25 +51,45 @@
   <p>Nobody has opened this room in years. You have a flashlight and not much else.</p>
   <p id="controlsTxt"></p>
   <button id="enter" disabled>Loading…</button>
-  <div id="loading"></div>
 </div>
 
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-  "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
 } }
 </script>
 
 <script type="module">
 import * as THREE from 'three';
-import * as CANNON from 'cannon-es';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const params = new URLSearchParams(location.search);
+const HAND_SIDE = params.get('hand') === 'left' ? 'left' : 'right';   // which hand holds the flashlight (?hand=left to flip)
+const DEBUG = params.has('debug');                                    // ?debug shows hand/torch placement sliders
 
 const isTouch = matchMedia('(pointer:coarse)').matches || 'ontouchstart' in window;
 const $ = id => document.getElementById(id);
+const enter = $('enter'), overlay = $('overlay');
 $('controlsTxt').textContent = isTouch
   ? 'Left thumb: move (push to the edge to run). Drag anywhere else: look. Buttons: flashlight, jump.'
   : 'WASD move, mouse look, Shift run, Space jump, F flashlight. Click to capture the mouse.';
+
+/* ---------- Rapier: Rust physics, prebuilt to WASM, loaded from a CDN ---------- */
+async function loadRapier() {
+  const urls = [
+    'https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.19.3/rapier.mjs',
+    'https://esm.sh/@dimforge/rapier3d-compat@0.19.3'
+  ];
+  for (const u of urls) {
+    try { const m = await import(u); const R = m.default || m; await R.init(); return R; }
+    catch (e) { console.warn('Rapier failed to load from', u, e); }
+  }
+  throw new Error('Rapier failed to load');
+}
+let RAPIER;
+try { RAPIER = await loadRapier(); }
+catch (e) { enter.textContent = 'Physics failed to load'; throw e; }
 
 /* ---------- renderer (kept light for low RAM) ---------- */
 const renderer = new THREE.WebGLRenderer({ antialias: !isTouch, powerPreference: 'default' });
@@ -80,7 +107,7 @@ scene.background = new THREE.Color(0x020203);
 scene.fog = new THREE.FogExp2(0x040405, 0.055);
 
 const FOV = 72;
-const camera = new THREE.PerspectiveCamera(FOV, innerWidth / innerHeight, 0.1, 40);
+const camera = new THREE.PerspectiveCamera(FOV, innerWidth / innerHeight, 0.03, 40);
 camera.rotation.order = 'YXZ';
 scene.add(camera);
 
@@ -157,19 +184,18 @@ const mat = (map, o = {}) => new THREE.MeshStandardMaterial(Object.assign({ map,
 const floorMat = mat(floorTex, { roughness: .8 });
 const woodMat = mat(woodTex);
 const plainMat = c => new THREE.MeshStandardMaterial({ color: c, roughness: .95 });
+const ironMat = new THREE.MeshStandardMaterial({ color: 0x2a2a2c, roughness: .55, metalness: .7 });
 
-/* ---------- physics world (cannon-es) ---------- */
-const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
-world.defaultContactMaterial.friction = 0;
-world.defaultContactMaterial.restitution = 0;
-world.allowSleep = false;
-
+/* ---------- physics world (Rapier) ---------- */
+const world = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
 const W = 10, D = 12, H = 3.2;   // room size (x, z, y)
 
+const quatY = ry => ({ x: 0, y: Math.sin(ry / 2), z: 0, w: Math.cos(ry / 2) });
 function physBox(x, y, z, w, h, d, ry = 0) {
-  const b = new CANNON.Body({ mass: 0, shape: new CANNON.Box(new CANNON.Vec3(w / 2, h / 2, d / 2)), position: new CANNON.Vec3(x, y, z) });
-  b.quaternion.setFromEuler(0, ry, 0);
-  world.addBody(b); return b;
+  world.createCollider(RAPIER.ColliderDesc.cuboid(w / 2, h / 2, d / 2).setTranslation(x, y, z).setRotation(quatY(ry)));
+}
+function physCyl(x, y, z, r, h) {
+  world.createCollider(RAPIER.ColliderDesc.cylinder(h / 2, r).setTranslation(x, y, z));
 }
 function addBox(x, y, z, w, h, d, material, ry = 0, physics = true) {
   const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
@@ -179,10 +205,8 @@ function addBox(x, y, z, w, h, d, material, ry = 0, physics = true) {
   return m;
 }
 
-// floor + ceiling + walls (colliders)
-const floorBody = new CANNON.Body({ mass: 0, shape: new CANNON.Plane() });
-floorBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
-world.addBody(floorBody);
+// floor, ceiling, walls (colliders)
+physBox(0, -.5, 0, W + 2, 1, D + 2);
 physBox(0, H + .5, 0, W + 2, 1, D + 2);
 physBox(0, H / 2, -D / 2 - .5, W + 2, H + 2, 1);
 physBox(0, H / 2,  D / 2 + .5, W + 2, H + 2, 1);
@@ -203,6 +227,22 @@ plane(W, H, wallMat(3.1), [0, H / 2, -D / 2], [0, 0, 0]);
 plane(W, H, wallMat(3.1), [0, H / 2,  D / 2], [0, Math.PI, 0]);
 plane(D, H, wallMat(3.75), [ W / 2, H / 2, 0], [0, -Math.PI / 2, 0]);
 plane(D, H, wallMat(3.75), [-W / 2, H / 2, 0], [0,  Math.PI / 2, 0]);
+
+// extra geometry: baseboards and ceiling beams (visual only)
+const bb = .12, bt = .03;
+addBox(0, bb / 2, -D / 2 + bt / 2, W, bb, bt, woodMat, 0, false);
+addBox(0, bb / 2,  D / 2 - bt / 2, W, bb, bt, woodMat, 0, false);
+addBox( W / 2 - bt / 2, bb / 2, 0, bt, bb, D, woodMat, 0, false);
+addBox(-W / 2 + bt / 2, bb / 2, 0, bt, bb, D, woodMat, 0, false);
+[-3.5, 0, 3.5].forEach(z => addBox(0, H - .1, z, W, .2, .22, woodMat, 0, false));
+
+// door in the south wall
+addBox(-2.2, 1.05, D / 2 - .03, 1.0, 2.1, .05, woodMat, 0, false);
+addBox(-2.2, 2.15, D / 2 - .04, 1.2, .1, .08, woodMat, 0, false);
+addBox(-2.75, 1.05, D / 2 - .04, .1, 2.1, .08, woodMat, 0, false);
+addBox(-1.65, 1.05, D / 2 - .04, .1, 2.1, .08, woodMat, 0, false);
+const knob = new THREE.Mesh(new THREE.SphereGeometry(.035, 8, 6), ironMat);
+knob.position.set(-1.9, 1.0, D / 2 - .09); scene.add(knob);
 
 // rug
 plane(3.2, 2.2, mat(rugTex, { roughness: 1 }), [1.2, 0.012, 1.0], [-Math.PI / 2, 0, 0.3]);
@@ -232,7 +272,7 @@ book(-2.0, .8, -3.3, .24, .06, .32, 1.1);
 book(3.0, .8, -3.4, .22, .05, .3, .6);
 const bottle = new THREE.Mesh(new THREE.CylinderGeometry(.05, .06, .26, 10), new THREE.MeshStandardMaterial({ color: 0x1a3a22, roughness: .25, metalness: .1 }));
 bottle.position.set(-1.7, .94, -3.7); bottle.castShadow = true; scene.add(bottle);
-physBox(-1.7, .94, -3.7, .12, .26, .12);
+physCyl(-1.7, .94, -3.7, .06, .26);
 
 // chair
 addBox(3.2, .45, -2.5, .45, .05, .45, woodMat);
@@ -240,15 +280,15 @@ addBox(3.2, .8, -2.27, .45, .6, .05, woodMat);
 [[-1, -1], [1, -1], [-1, 1], [1, 1]].forEach(([sx, sz]) => addBox(3.2 + sx * .19, .21, -2.5 + sz * .19, .05, .42, .05, woodMat));
 
 // bookshelf against the north wall
-const sx = .5, sz = -5.75;
-physBox(sx, 1.1, sz, 2.0, 2.2, .5);
-addBox(sx, 1.1, -5.97, 2.0, 2.2, .04, woodMat, 0, false);
-addBox(sx - .98, 1.1, sz, .04, 2.2, .5, woodMat, 0, false);
-addBox(sx + .98, 1.1, sz, .04, 2.2, .5, woodMat, 0, false);
-[.04, .6, 1.15, 1.7, 2.2].forEach(y => addBox(sx, y, sz, 2.0, .04, .5, woodMat, 0, false));
+const shx = .5, shz = -5.75;
+physBox(shx, 1.1, shz, 2.0, 2.2, .5);
+addBox(shx, 1.1, -5.97, 2.0, 2.2, .04, woodMat, 0, false);
+addBox(shx - .98, 1.1, shz, .04, 2.2, .5, woodMat, 0, false);
+addBox(shx + .98, 1.1, shz, .04, 2.2, .5, woodMat, 0, false);
+[.04, .6, 1.15, 1.7, 2.2].forEach(y => addBox(shx, y, shz, 2.0, .04, .5, woodMat, 0, false));
 [.06, .62, 1.17, 1.72].forEach(y => {
-  let x = sx - .9;
-  while (x < sx + .85) {
+  let x = shx - .9;
+  while (x < shx + .85) {
     if (Math.random() < .12) { x += rnd(.1, .3); continue; }
     const bw = rnd(.04, .09), bh = rnd(.26, .44);
     book(x + bw / 2, y, -5.68, bw, bh, .27, 0, false);
@@ -261,10 +301,14 @@ addBox(-4.2, .4, 3.5, .8, .8, .8, woodMat, .1);
 addBox(-4.2, .4, 4.45, .8, .8, .8, woodMat, -.05);
 addBox(-4.15, 1.2, 3.55, .7, .7 * 1.14, .7, woodMat, .5);
 
-// barrel
-const barrel = new THREE.Mesh(new THREE.CylinderGeometry(.38, .34, 1, 14), woodMat);
+// barrel with iron hoops, true cylinder collider
+const barrel = new THREE.Mesh(new THREE.CylinderGeometry(.38, .34, 1, 16), woodMat);
 barrel.position.set(4.2, .5, -.8); barrel.castShadow = barrel.receiveShadow = true; scene.add(barrel);
-physBox(4.2, .5, -.8, .7, 1, .7);
+[.18, .82].forEach(y => {
+  const hoop = new THREE.Mesh(new THREE.TorusGeometry(.36, .018, 6, 20), ironMat);
+  hoop.rotation.x = Math.PI / 2; hoop.position.set(4.2, y, -.8); hoop.castShadow = true; scene.add(hoop);
+});
+physCyl(4.2, .5, -.8, .38, 1);
 
 // stack of books on the floor
 book(0.2, 0, 2.6, .5, .08, .36, .4);
@@ -277,22 +321,133 @@ book(2.0, 0, 3.0, .3, .09, .22, .2);
 scene.add(new THREE.HemisphereLight(0x303848, 0x100c08, 0.18));   // faint ambient so it's not pure black
 
 // faint moonlit window on the east wall
-const win = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 1.4),
-  new THREE.MeshBasicMaterial({ color: 0x1a2a44 }));
+const win = new THREE.Mesh(new THREE.PlaneGeometry(1.2, 1.4), new THREE.MeshBasicMaterial({ color: 0x1a2a44 }));
 win.position.set(W / 2 - .01, 1.8, -1.8); win.rotation.y = -Math.PI / 2; scene.add(win);
 const moon = new THREE.PointLight(0x5577aa, 3, 7, 2);
 moon.position.set(W / 2 - .6, 1.8, -1.8); scene.add(moon);
 
-// flashlight
+/* ---------- viewmodel: hand holding the flashlight ---------- */
+const vm = new THREE.Group(); camera.add(vm);
+const handGroup = new THREE.Group(), torchGroup = new THREE.Group();
+vm.add(handGroup, torchGroup);
+
+// placement defaults (tune live with ?debug, then paste the printed values back here)
+const CFG = {
+  hand:  { p: [0.20, -0.30, -0.28], r: [0, 0, 0], s: 1 },
+  torch: { p: [0.20, -0.20, -0.34], r: [0, 4, 0], s: 1 }       // rotation in degrees
+};
+function applyCfg() {
+  [[handGroup, CFG.hand], [torchGroup, CFG.torch]].forEach(([g, c]) => {
+    g.position.set(...c.p);
+    g.rotation.set(...c.r.map(THREE.MathUtils.degToRad));
+    g.scale.setScalar(c.s);
+  });
+}
+applyCfg();
+
+// procedural flashlight, axis along -Z, origin at the lens
+const torchBodyMat = new THREE.MeshStandardMaterial({ color: 0x1d1d20, roughness: .5, metalness: .7 });
+const lensMat = new THREE.MeshBasicMaterial({ color: 0xfff1c9 });
+const tBody = new THREE.Mesh(new THREE.CylinderGeometry(.026, .026, .17, 14).rotateX(Math.PI / 2), torchBodyMat);
+tBody.position.z = .1;
+const tHead = new THREE.Mesh(new THREE.CylinderGeometry(.04, .028, .05, 14).rotateX(Math.PI / 2), torchBodyMat);
+tHead.position.z = .0;
+const tLens = new THREE.Mesh(new THREE.CircleGeometry(.036, 14), lensMat);
+tLens.position.z = -.026; tLens.rotation.y = Math.PI;
+torchGroup.add(tBody, tHead, tLens);
+
+// the flashlight beam
 const FL_ANGLE = 0.46, FL_BASE = 90;
 const flash = new THREE.SpotLight(0xffe9c4, FL_BASE, 15, FL_ANGLE, 0.55, 2);
 flash.castShadow = true;
 flash.shadow.mapSize.set(isTouch ? 512 : 1024, isTouch ? 512 : 1024);
 flash.shadow.camera.near = 0.1; flash.shadow.camera.far = 15;
 flash.shadow.bias = -0.0004; flash.shadow.normalBias = 0.02;
-flash.position.set(0.22, -0.18, 0);
-flash.target.position.set(0, -0.05, -6);
-camera.add(flash); camera.add(flash.target);
+flash.position.set(0, 0, -.04);
+flash.target.position.set(0, 0, -6);
+torchGroup.add(flash, flash.target);
+
+// hands.glb: two hands in the file, only one stays visible
+const SIDE_RE = {
+  left:  /left|(^|[^a-z0-9])l([^a-z0-9]|$)|\.l$|_l$|^l_/i,
+  right: /right|(^|[^a-z0-9])r([^a-z0-9]|$)|\.r$|_r$|^r_/i
+};
+const hiddenBones = [];
+let mixer = null;
+
+function keepOneHand(root, keep) {
+  const drop = keep === 'right' ? 'left' : 'right';
+  let hidden = 0;
+  const names = [];
+  root.traverse(o => {
+    if (o === root) return;
+    names.push(o.name);
+    const isDrop = SIDE_RE[drop].test(o.name) && !SIDE_RE[keep].test(o.name);
+    if (!isDrop) return;
+    if (o.isBone) { o.scale.setScalar(0.0001); hiddenBones.push(o); hidden++; }   // collapses skinned verts weighted to it
+    else if (o.isMesh || o.isGroup || o.isObject3D) { o.visible = false; hidden++; }
+  });
+  if (hidden === 0) {
+    // names carry no side: fall back to position. glTF faces +Z, so the model's right hand sits at lower X.
+    const meshes = []; root.traverse(o => { if (o.isMesh) meshes.push(o); });
+    if (meshes.length >= 2) {
+      const cx = m => new THREE.Box3().setFromObject(m).getCenter(new THREE.Vector3()).x;
+      meshes.sort((a, b) => cx(a) - cx(b));
+      (keep === 'right' ? meshes[meshes.length - 1] : meshes[0]).visible = false;
+      hidden = 1;
+      console.warn('[hands.glb] no left/right in node names, picked by position. Use ?hand=left to flip.');
+    } else {
+      console.warn('[hands.glb] could not separate the hands. Node names:', names);
+      $('hint').textContent = 'hands.glb: could not tell the two hands apart (see console)';
+    }
+  }
+  console.info('[hands.glb] kept', keep, 'hand; hid', hidden, 'nodes. Nodes:', names);
+}
+
+new GLTFLoader().load('hands.glb', gltf => {
+  const root = gltf.scene;
+  keepOneHand(root, HAND_SIDE);
+  root.traverse(o => {
+    if (o.isMesh) {
+      o.castShadow = o.receiveShadow = false; o.frustumCulled = false;
+      (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => {
+        m.fog = false;
+        if (m.isMeshStandardMaterial) { m.emissive = new THREE.Color(0x2a2420); if (m.map) m.emissiveMap = m.map; }
+      });
+    }
+  });
+  handGroup.add(root);
+  if (gltf.animations && gltf.animations.length) {
+    mixer = new THREE.AnimationMixer(root);
+    const clip = gltf.animations.find(a => /hold|grip|idle/i.test(a.name)) || gltf.animations[0];
+    mixer.clipAction(clip).play();
+  }
+}, undefined, err => console.warn('hands.glb not loaded (is it next to index.html?)', err));
+
+// light-on state on the lens
+let lightOn = true;
+function toggleLight() { lightOn = !lightOn; lensMat.color.set(lightOn ? 0xfff1c9 : 0x3a372f); $('bLight').classList.toggle('on', lightOn); }
+
+// debug placement panel
+if (DEBUG) {
+  const p = $('dbg'); p.style.display = 'block';
+  p.innerHTML = '<select id="dbgSel"><option value="hand">hand</option><option value="torch">flashlight</option></select><div id="dbgRows"></div><pre id="dbgOut"></pre>';
+  const rows = $('dbgRows'), sel = $('dbgSel'), out = $('dbgOut');
+  const defs = [['px', 'p', 0, -.6, .6, .005], ['py', 'p', 1, -.6, .6, .005], ['pz', 'p', 2, -1, .2, .005],
+                ['rx', 'r', 0, -180, 180, 1], ['ry', 'r', 1, -180, 180, 1], ['rz', 'r', 2, -180, 180, 1], ['sc', 's', -1, .05, 5, .01]];
+  const render = () => {
+    rows.innerHTML = '';
+    defs.forEach(([lab, key, idx, mn, mx, st]) => {
+      const c = CFG[sel.value], row = document.createElement('label');
+      const inp = document.createElement('input'); inp.type = 'range'; inp.min = mn; inp.max = mx; inp.step = st;
+      inp.value = idx < 0 ? c[key] : c[key][idx];
+      inp.oninput = () => { const v = parseFloat(inp.value); if (idx < 0) c[key] = v; else c[key][idx] = v; applyCfg(); out.textContent = JSON.stringify(CFG); };
+      row.innerHTML = `<span>${lab}</span>`; row.appendChild(inp); rows.appendChild(row);
+    });
+    out.textContent = JSON.stringify(CFG);
+  };
+  sel.onchange = render; render();
+}
 
 /* ---------- floating dust (custom GLSL shader) ---------- */
 const DUST = isTouch ? 500 : 900;
@@ -347,26 +502,28 @@ scene.add(dust);
 function setDustScale() { dustMat.uniforms.uScale.value = innerHeight * PR / (2 * Math.tan(THREE.MathUtils.degToRad(FOV / 2))); }
 setDustScale();
 
-/* ---------- player body: 3 stacked spheres, can't pass tables or books ---------- */
-const player = new CANNON.Body({ mass: 70, position: new CANNON.Vec3(3.6, 0.02, 4.6), fixedRotation: true, linearDamping: 0 });
-[0.3, 0.75, 1.2].forEach(y => player.addShape(new CANNON.Sphere(0.3), new CANNON.Vec3(0, y, 0)));
-player.updateMassProperties();
-world.addBody(player);
-let canJump = false;
-const up = new CANNON.Vec3(0, 1, 0), cn = new CANNON.Vec3();
-player.addEventListener('collide', e => {
-  const c = e.contact;
-  if (c.bi.id === player.id) c.ni.negate(cn); else cn.copy(c.ni);
-  if (cn.dot(up) > 0.5) canJump = true;
-});
+/* ---------- player: Rapier capsule + kinematic character controller ---------- */
+const P_RAD = .3, P_HALF = .55, P_CENTER = P_HALF + P_RAD;      // capsule is 1.7 m tall
+const START = { x: 3.6, z: 4.6 };
+const pos = { x: START.x, y: P_CENTER + .02, z: START.z };
+const pBody = world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(pos.x, pos.y, pos.z));
+const pCol = world.createCollider(RAPIER.ColliderDesc.capsule(P_HALF, P_RAD), pBody);
+const cc = world.createCharacterController(0.02);
+cc.setUp({ x: 0, y: 1, z: 0 });
+cc.setSlideEnabled(true);
+cc.enableAutostep(0.3, 0.1, false);          // steps over low books/thresholds
+cc.enableSnapToGround(0.15);
+cc.setMaxSlopeClimbAngle(Math.PI / 4);
+cc.setMinSlopeSlideAngle(Math.PI / 3);
+world.step();                                // build the query pipeline once
+let vy = 0, vx = 0, vz = 0, grounded = false;
 
 /* ---------- input ---------- */
 let yaw = 0.3, pitch = 0;
 const keys = {};
-let jumpReq = false, lightOn = true, runToggle = false;
+let jumpReq = false, runToggle = false;
 const joy = { id: null, x: 0, y: 0 }, look = { id: null, x: 0, y: 0 };
 
-function toggleLight() { lightOn = !lightOn; $('bLight').classList.toggle('on', lightOn); }
 addEventListener('keydown', e => {
   keys[e.code] = true;
   if (e.code === 'Space') jumpReq = true;
@@ -379,6 +536,7 @@ addEventListener('mousemove', e => {
   pitch = Math.max(-1.45, Math.min(1.45, pitch - e.movementY * 0.0022));
 });
 
+let started = false;
 if (isTouch) {
   $('joy').style.display = 'block';
   ['bLight', 'bRun', 'bJump'].forEach(id => $(id).style.display = 'flex');
@@ -388,16 +546,17 @@ if (isTouch) {
   press('bJump', () => jumpReq = true);
   press('bRun', () => { runToggle = !runToggle; $('bRun').classList.toggle('on', runToggle); });
 
-  const joyEl = $('joy'), knob = $('knob');
+  const joyEl = $('joy'), knobEl = $('knob');
   const setJoy = t => {
     const r = joyEl.getBoundingClientRect(), R = r.width / 2;
     let dx = (t.clientX - (r.left + R)) / R, dy = (t.clientY - (r.top + R)) / R;
     const len = Math.hypot(dx, dy); if (len > 1) { dx /= len; dy /= len; }
     joy.x = dx; joy.y = dy;
-    knob.style.transform = `translate(${dx * R * .7}px, ${dy * R * .7}px)`;
+    knobEl.style.transform = `translate(${dx * R * .7}px, ${dy * R * .7}px)`;
   };
   addEventListener('touchstart', e => {
     if (!started) return;
+    if (e.target.closest && e.target.closest('#dbg')) return;
     for (const t of e.changedTouches) {
       if (t.target.closest && t.target.closest('.btn')) continue;
       if (t.target.closest && t.target.closest('#joy') && joy.id === null) { joy.id = t.identifier; setJoy(t); }
@@ -406,6 +565,7 @@ if (isTouch) {
     e.preventDefault();
   }, { passive: false });
   addEventListener('touchmove', e => {
+    if (e.target.closest && e.target.closest('#dbg')) return;
     for (const t of e.changedTouches) {
       if (t.identifier === joy.id) setJoy(t);
       else if (t.identifier === look.id) {
@@ -418,7 +578,7 @@ if (isTouch) {
   }, { passive: false });
   const end = e => {
     for (const t of e.changedTouches) {
-      if (t.identifier === joy.id) { joy.id = null; joy.x = joy.y = 0; knob.style.transform = ''; }
+      if (t.identifier === joy.id) { joy.id = null; joy.x = joy.y = 0; knobEl.style.transform = ''; }
       if (t.identifier === look.id) look.id = null;
     }
   };
@@ -426,11 +586,9 @@ if (isTouch) {
 }
 
 /* ---------- start / pause ---------- */
-let started = false;
-const overlay = $('overlay'), enter = $('enter');
 function startGame() {
   started = true; overlay.style.display = 'none';
-  $('hint').textContent = isTouch ? 'Find something worth finding.' : 'Esc to release the mouse.';
+  if (!$('hint').textContent) $('hint').textContent = isTouch ? 'Find something worth finding.' : 'Esc to release the mouse.';
   $('hint').style.opacity = 1; setTimeout(() => $('hint').style.opacity = 0, 5000);
   if (isTouch) { try { document.documentElement.requestFullscreen && document.documentElement.requestFullscreen(); } catch (_) {} }
   else renderer.domElement.requestPointerLock();
@@ -448,11 +606,11 @@ addEventListener('resize', () => {
 
 /* ---------- main loop ---------- */
 const clock = new THREE.Clock();
-const camDir = new THREE.Vector3();
+const tmpA = new THREE.Vector3(), tmpB = new THREE.Vector3();
 let bob = 0, flickT = 0;
 
 function update(dt) {
-  // movement input
+  // wish direction
   let ix = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0) + joy.x;
   let iz = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0) - joy.y;
   const len = Math.hypot(ix, iz); if (len > 1) { ix /= len; iz /= len; }
@@ -461,31 +619,51 @@ function update(dt) {
   const s = Math.sin(yaw), c = Math.cos(yaw);
   const tx = (-s * iz + c * ix) * speed, tz = (-c * iz - s * ix) * speed;
   const k = 1 - Math.exp(-dt * 12);
-  player.velocity.x += (tx - player.velocity.x) * k;
-  player.velocity.z += (tz - player.velocity.z) * k;
+  vx += (tx - vx) * k; vz += (tz - vz) * k;
 
-  if (jumpReq && canJump) { player.velocity.y = 4.6; }
-  jumpReq = false; canJump = false;
-  world.step(1 / 60, dt, 4);
-  if (player.position.y < -3) { player.position.set(3.6, 0.1, 4.6); player.velocity.set(0, 0, 0); }
+  // gravity + jump
+  if (grounded && vy < 0) vy = -1;
+  vy -= 9.81 * dt;
+  if (jumpReq && grounded) vy = 4.6;
+  jumpReq = false;
+
+  // Rapier character controller resolves walls, tables, books, steps
+  const desired = { x: vx * dt, y: vy * dt, z: vz * dt };
+  cc.computeColliderMovement(pCol, desired);
+  const m = cc.computedMovement();
+  grounded = cc.computedGrounded();
+  if (vy > 0 && m.y < desired.y - 0.001) vy = 0;       // bumped the ceiling
+  pos.x += m.x; pos.y += m.y; pos.z += m.z;
+  pBody.setNextKinematicTranslation(pos);
+  world.step();
+  if (pos.y < -3) { pos.x = START.x; pos.y = P_CENTER + .1; pos.z = START.z; vy = 0; }
 
   // camera
-  const moving = Math.hypot(player.velocity.x, player.velocity.z);
+  const moving = grounded ? Math.hypot(vx, vz) : 0;
   bob += moving * dt * 2.6;
   const bobY = Math.sin(bob) * 0.03 * Math.min(1, moving / 2);
-  camera.position.set(player.position.x, player.position.y + 1.55 + bobY, player.position.z);
+  camera.position.set(pos.x, pos.y - P_CENTER + 1.55 + bobY, pos.z);
   camera.rotation.set(pitch, yaw, 0);
+
+  // viewmodel sway
+  vm.position.set(Math.cos(bob * .5) * .006 * Math.min(1, moving / 2), bobY * .6, 0);
+
+  // hand animation (re-collapse the hidden hand's bones after the mixer writes them)
+  if (mixer) mixer.update(dt);
+  for (let i = 0; i < hiddenBones.length; i++) hiddenBones[i].scale.setScalar(0.0001);
 
   // flashlight with occasional flicker
   if (flickT <= 0 && Math.random() < 0.004) flickT = 0.12;
   let f = 1; if (flickT > 0) { flickT -= dt; f = 0.3 + Math.random() * 0.5; }
   flash.intensity = lightOn ? FL_BASE * f : 0;
 
-  // dust shader uniforms
+  // dust shader uniforms follow the actual flashlight
+  camera.updateMatrixWorld(true);
+  flash.getWorldPosition(tmpA); flash.target.getWorldPosition(tmpB);
   const u = dustMat.uniforms;
   u.uTime.value += dt;
-  u.uPos.value.copy(camera.position);
-  camera.getWorldDirection(camDir); u.uDir.value.copy(camDir);
+  u.uPos.value.copy(tmpA);
+  u.uDir.value.copy(tmpB.sub(tmpA).normalize());
   u.uOn.value = lightOn ? f : 0;
 }
 
@@ -493,11 +671,11 @@ function tick() {
   requestAnimationFrame(tick);
   const dt = Math.min(clock.getDelta(), 0.05);
   if (started) update(dt);
-  else { dustMat.uniforms.uTime.value += dt; }
+  else dustMat.uniforms.uTime.value += dt;
   renderer.render(scene, camera);
 }
 
-camera.position.set(3.6, 1.57, 4.6); camera.rotation.set(0, yaw, 0);
+camera.position.set(START.x, 1.57, START.z); camera.rotation.set(0, yaw, 0);
 enter.disabled = false; enter.textContent = 'Enter';
 tick();
 </script>
